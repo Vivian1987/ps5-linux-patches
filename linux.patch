@@ -1454,7 +1454,7 @@ index 616967519869..5277ecfc8593 100644
  	if (i != 0 && adev->vcn.per_inst_fw) {
  		r = amdgpu_ucode_request(adev, &adev->vcn.inst[i].fw,
 diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v10_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v10_0.c
-index a9961d504833..ed3e2ffef1b8 100644
+index a9961d504833..ed3ad2f233d7 100644
 --- a/drivers/gpu/drm/amd/amdgpu/gfx_v10_0.c
 +++ b/drivers/gpu/drm/amd/amdgpu/gfx_v10_0.c
 @@ -4202,6 +4202,14 @@ static void gfx_v10_0_check_gfxoff_flag(struct amdgpu_device *adev)
@@ -1532,8 +1532,8 @@ index a9961d504833..ed3e2ffef1b8 100644
  		amdgpu_gfx_cp_init_microcode(adev, AMDGPU_UCODE_ID_CP_MEC2);
  		amdgpu_gfx_cp_init_microcode(adev, AMDGPU_UCODE_ID_CP_MEC2_JT);
  	} else {
-@@ -10112,6 +10138,21 @@ static u32 gfx_v10_0_get_cu_active_bitmap_per_sh(struct amdgpu_device *adev)
- 	return cu_active_bitmap;
+@@ -7820,12 +7846,34 @@ static void gfx_v10_0_ring_emit_gds_switch(struct amdgpu_ring *ring,
+ 				    (1 << (oa_size + oa_base)) - (1 << oa_base));
  }
  
 +/* PS5 harvested-CU unlock.
@@ -1542,6 +1542,7 @@ index a9961d504833..ed3e2ffef1b8 100644
 + *   2 = unlock SE0/SH0 only
 + *   3 = unlock all SE/SH (default)
 + *   4 = probe only, all SE/SH
++ *   5 = EXPERIMENTAL: unlock all 64 CUs (PS5 Pro only): 8 WGPs per SE/SH
 + * Override on the kernel command line, e.g.:
 + *   amdgpu.ps5_cu_unlock=0   (disable)
 + *   amdgpu.ps5_cu_unlock=1   (probe)
@@ -1549,12 +1550,24 @@ index a9961d504833..ed3e2ffef1b8 100644
 +static int ps5_cu_unlock = 0;
 +module_param(ps5_cu_unlock, int, 0444);
 +MODULE_PARM_DESC(ps5_cu_unlock,
-+	"PS5 harvested-CU unlock (0=off (default), 1=probe, 2=SE0/SH0, 3=all, 4=probe-all)");
++	"PS5 harvested-CU unlock (0=off (default), 1=probe, 2=SE0/SH0, 3=all, 4=probe-all, 5=EXPERIMENTAL: unlock all 64 CUs (PS5 Pro only))");
 +
- static int gfx_v10_0_get_cu_info(struct amdgpu_device *adev,
- 				 struct amdgpu_cu_info *cu_info)
+ static int gfx_v10_0_early_init(struct amdgpu_ip_block *ip_block)
  {
-@@ -10125,6 +10166,43 @@ static int gfx_v10_0_get_cu_info(struct amdgpu_device *adev,
+ 	struct amdgpu_device *adev = ip_block->adev;
+ 
+ 	adev->gfx.funcs = &gfx_v10_0_gfx_funcs;
+ 
++	/* PS5 Pro: 2 SE x 2 SH x 8 WGPs = 64 CUs. Raise the hardcoded
++	 * 10 CUs per SH before anything sizes itself from it (GDS below,
++	 * CU info in hw_init). */
++	if (ps5_cu_unlock == 5)
++		adev->gfx.config.max_cu_per_sh = 16;
++
+ 	switch (amdgpu_ip_version(adev, GC_HWIP, 0)) {
+ 	case IP_VERSION(10, 1, 10):
+ 	case IP_VERSION(10, 1, 1):
+@@ -10125,6 +10173,54 @@ static int gfx_v10_0_get_cu_info(struct amdgpu_device *adev,
  	amdgpu_gfx_parse_disable_cu(adev, disable_masks, 4, 2);
  
  	mutex_lock(&adev->grbm_idx_mutex);
@@ -1563,6 +1576,8 @@ index a9961d504833..ed3e2ffef1b8 100644
 +	 * (verified empirically on BC-250). */
 +	if (ps5_cu_unlock > 0) {
 +		int ps5_se, ps5_sh;
++		/* WGPs this driver drives per SE/SH: 0x1f (40 CUs), 0xff in mode 5. */
++		u32 ps5_wgp_mask = amdgpu_gfx_create_bitmask(adev->gfx.config.max_cu_per_sh >> 1);
 +		for (ps5_se = 0; ps5_se < adev->gfx.config.max_shader_engines; ps5_se++) {
 +			for (ps5_sh = 0; ps5_sh < adev->gfx.config.max_sh_per_se; ps5_sh++) {
 +				u32 ps5_cc_orig, ps5_cc_after, ps5_spi_orig, ps5_spi_after;
@@ -1570,12 +1585,18 @@ index a9961d504833..ed3e2ffef1b8 100644
 +					continue;
 +				gfx_v10_0_select_se_sh(adev, ps5_se, ps5_sh, 0xffffffff, 0);
 +				ps5_cc_orig = RREG32_SOC15(GC, 0, mmCC_GC_SHADER_ARRAY_CONFIG);
-+				WREG32_SOC15(GC, 0, mmCC_GC_SHADER_ARRAY_CONFIG, 0);
++				if (ps5_cu_unlock == 5)
++					/* Clear harvest bits for WGP0-7 only; WGP8-15 do not exist. */
++					WREG32_SOC15(GC, 0, mmCC_GC_SHADER_ARRAY_CONFIG,
++						     ps5_cc_orig & ~(ps5_wgp_mask <<
++								     CC_GC_SHADER_ARRAY_CONFIG__INACTIVE_WGPS__SHIFT));
++				else
++					WREG32_SOC15(GC, 0, mmCC_GC_SHADER_ARRAY_CONFIG, 0);
 +				ps5_cc_after = RREG32_SOC15(GC, 0, mmCC_GC_SHADER_ARRAY_CONFIG);
 +				ps5_spi_orig = RREG32_SOC15(GC, 0, mmSPI_PG_ENABLE_STATIC_WGP_MASK);
-+				WREG32_SOC15(GC, 0, mmSPI_PG_ENABLE_STATIC_WGP_MASK, 0x1f);
++				WREG32_SOC15(GC, 0, mmSPI_PG_ENABLE_STATIC_WGP_MASK, ps5_wgp_mask);
 +				ps5_spi_after = RREG32_SOC15(GC, 0, mmSPI_PG_ENABLE_STATIC_WGP_MASK);
-+				WREG32_SOC15(GC, 0, mmRLC_PG_ALWAYS_ON_WGP_MASK, 0x1f);
++				WREG32_SOC15(GC, 0, mmRLC_PG_ALWAYS_ON_WGP_MASK, ps5_wgp_mask);
 +				if (ps5_cu_unlock == 1 || ps5_cu_unlock == 4) {
 +					WREG32_SOC15(GC, 0, mmCC_GC_SHADER_ARRAY_CONFIG, ps5_cc_orig);
 +					WREG32_SOC15(GC, 0, mmSPI_PG_ENABLE_STATIC_WGP_MASK, ps5_spi_orig);
@@ -1586,7 +1607,10 @@ index a9961d504833..ed3e2ffef1b8 100644
 +						ps5_spi_orig, ps5_spi_after);
 +				} else {
 +					dev_info(adev->dev,
-+						"ps5-40cu-enable: mode=%d se=%d sh=%d CC=0x%08x->0x%08x SPI=0x%08x->0x%08x",
++						"ps5-%dcu-enable: mode=%d se=%d sh=%d CC=0x%08x->0x%08x SPI=0x%08x->0x%08x",
++						adev->gfx.config.max_cu_per_sh *
++						adev->gfx.config.max_sh_per_se *
++						adev->gfx.config.max_shader_engines,
 +						ps5_cu_unlock, ps5_se, ps5_sh,
 +						ps5_cc_orig, ps5_cc_after,
 +						ps5_spi_orig, ps5_spi_after);
